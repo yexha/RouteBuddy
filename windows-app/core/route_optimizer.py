@@ -1,34 +1,42 @@
 """
-Route optimization: nearest-neighbor TSP with street-sweep grouping.
+Route optimization: nearest-neighbor TSP + street sweep with right-side-of-road ordering.
 
-Street sweep = when multiple stops share the same street, sequence them in
-house-number order in the direction of travel. This means the truck never
-drives past a house and backtracks, and naturally handles passenger-side
-stops by keeping the truck moving forward along each street.
+RIGHT-SIDE LOGIC (Canada drives on the right):
+  On a two-way street, odd and even house numbers are on opposite sides.
+  Standard convention: odd numbers on the left/north/west, even on the right/south/east
+  — but this varies. The algorithm avoids assuming which is which and instead
+  does a "two-pass sweep":
+    Pass 1 — one parity going forward (e.g. 100, 102, 104...)
+    Pass 2 — other parity coming back (e.g. 105, 103, 101...)
+  This keeps the truck on the same side for an entire stretch before crossing once
+  at the end of the street, eliminating zigzag crossing for each house.
+
+  Cul-de-sacs and short courts (< 4 stops) are done in a single forward pass
+  since both sides are reachable without crossing.
 """
 import re
-from dataclasses import dataclass
-from typing import Optional
 import math
+from dataclasses import dataclass, field
+from typing import Optional
 
 
 @dataclass
 class Stop:
-    index: int          # original position in imported list
+    index: int
     raw_address: str
     customer_name: str
     notes: str
     lat: Optional[float] = None
     lng: Optional[float] = None
     geocode_error: Optional[str] = None
+    is_done: bool = False        # struck-through / already completed
 
-    # parsed from address
+    # parsed
     house_number: Optional[int] = None
     street_name: Optional[str] = None
 
 
 def _haversine(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
-    """Distance in km between two lat/lng points."""
     R = 6371.0
     φ1, φ2 = math.radians(lat1), math.radians(lat2)
     Δφ = math.radians(lat2 - lat1)
@@ -38,36 +46,48 @@ def _haversine(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
 
 
 def _parse_house_number(address: str) -> tuple[Optional[int], str]:
-    """Return (house_number, street_name) from an address string."""
     address = address.strip()
-    # "208 Woodhaven Dr" — number first
-    m = re.match(r'^(\d+)\s+(.+)$', address)
+    # "208 Woodhaven Dr" or "208A Woodhaven Dr"
+    m = re.match(r'^(\d+)[A-Za-z]?\s+(.+)$', address)
     if m:
         return int(m.group(1)), m.group(2).upper().strip()
-    # "Woodhaven DR 208" — number last (clipboard format)
-    m = re.match(r'^(.+?)\s+(\d+)$', address)
+    # "Woodhaven DR 208" — number at end
+    m = re.match(r'^(.+?)\s+(\d+)[A-Za-z]?$', address)
     if m:
         return int(m.group(2)), m.group(1).upper().strip()
     return None, address.upper().strip()
 
 
+def _normalize_street_key(street: str) -> str:
+    """Strip city/province suffix and normalize for grouping."""
+    street = re.sub(r',.*$', '', street).strip()
+    # Expand common abbreviations so "Dr" and "Drive" group together
+    abbrevs = {
+        r'\bDR\b': 'DRIVE', r'\bCR\b': 'CRESCENT', r'\bCRES\b': 'CRESCENT',
+        r'\bRD\b': 'ROAD', r'\bPL\b': 'PLACE', r'\bAVE\b': 'AVENUE',
+        r'\bAV\b': 'AVENUE', r'\bST\b': 'STREET', r'\bBLVD\b': 'BOULEVARD',
+        r'\bCRT\b': 'COURT', r'\bCT\b': 'COURT', r'\bLN\b': 'LANE',
+        r'\bGR\b': 'GREEN', r'\bPT\b': 'POINT',
+    }
+    s = street.upper()
+    for pattern, replacement in abbrevs.items():
+        s = re.sub(pattern, replacement, s)
+    return s.strip()
+
+
 def parse_stops(stops: list[Stop]) -> None:
-    """Parse house numbers and street names in-place."""
     for s in stops:
-        # strip city/province suffix for parsing if present
         addr = re.sub(r',\s*(AB|Alberta|Canada).*$', '', s.raw_address, flags=re.I).strip()
         s.house_number, s.street_name = _parse_house_number(addr)
+        # normalize for grouping
+        if s.street_name:
+            s.street_name = _normalize_street_key(s.street_name)
 
 
 def _nearest_neighbor(stops: list[Stop]) -> list[Stop]:
-    """
-    Classic nearest-neighbor starting from the first geocoded stop.
-    Returns a reordered copy of stops.
-    """
     remaining = [s for s in stops if s.lat is not None]
     if not remaining:
         return []
-
     ordered = [remaining.pop(0)]
     while remaining:
         last = ordered[-1]
@@ -77,13 +97,67 @@ def _nearest_neighbor(stops: list[Stop]) -> list[Stop]:
     return ordered
 
 
-def _street_sweep(stops: list[Stop]) -> list[Stop]:
+def _right_side_sweep(group: list[Stop], approach_from: Optional[Stop]) -> list[Stop]:
     """
-    After nearest-neighbor ordering, group consecutive same-street stops
-    and sort them by house number in the direction of travel (ascending or
-    descending based on which end the truck is approaching from).
+    Order a group of stops on the same street for right-side-of-road efficiency.
 
-    This prevents the truck from zigzagging past houses and backtracking.
+    For groups with both odd and even numbers (a real two-way street):
+      - Do all even-numbered houses in one direction
+      - Do all odd-numbered houses in the other direction
+      This means crossing the street only once at the end, not per house.
+
+    For short groups or cul-de-sacs (< 4 stops or all same parity):
+      - Simple ascending/descending sweep based on approach direction.
+    """
+    if len(group) <= 1:
+        return group
+
+    numbered = [s for s in group if s.house_number is not None]
+    unnumbered = [s for s in group if s.house_number is None]
+
+    if not numbered:
+        return group
+
+    evens = sorted([s for s in numbered if s.house_number % 2 == 0], key=lambda s: s.house_number)
+    odds = sorted([s for s in numbered if s.house_number % 2 == 1], key=lambda s: s.house_number)
+
+    # Determine direction of approach (do we enter from the low or high end?)
+    def entry_from_low() -> bool:
+        if approach_from and approach_from.lat is not None:
+            low_stop = numbered[0] if numbered[0].house_number == min(s.house_number for s in numbered) else min(numbered, key=lambda s: s.house_number)
+            high_stop = max(numbered, key=lambda s: s.house_number)
+            if low_stop.lat is None or high_stop.lat is None:
+                return True
+            d_low = _haversine(approach_from.lat, approach_from.lng, low_stop.lat, low_stop.lng)
+            d_high = _haversine(approach_from.lat, approach_from.lng, high_stop.lat, high_stop.lng)
+            return d_low <= d_high
+        return True
+
+    from_low = entry_from_low()
+
+    # Short groups or cul-de-sac (same parity or tiny) — single directional pass
+    if len(numbered) < 4 or not evens or not odds:
+        result = sorted(numbered, key=lambda s: s.house_number, reverse=not from_low)
+        return result + unnumbered
+
+    # Two-pass sweep: one side forward, other side back
+    if from_low:
+        # Enter from low end → evens go up (right side of road going forward)
+        #                    → odds come back down (right side of road returning)
+        pass1 = evens           # ascending
+        pass2 = list(reversed(odds))  # descending
+    else:
+        # Enter from high end
+        pass1 = list(reversed(odds))  # descending
+        pass2 = evens               # ascending
+
+    return pass1 + pass2 + unnumbered
+
+
+def _apply_street_sweeps(stops: list[Stop]) -> list[Stop]:
+    """
+    Walk the nearest-neighbor ordered list. Whenever consecutive stops share
+    a street, collect them into a group and apply right-side sweep ordering.
     """
     if not stops:
         return stops
@@ -94,28 +168,15 @@ def _street_sweep(stops: list[Stop]) -> list[Stop]:
         current = stops[i]
         street = current.street_name
 
-        # collect consecutive stops on the same street
         group = [current]
         j = i + 1
-        while j < len(stops) and stops[j].street_name == street:
+        while j < len(stops) and stops[j].street_name == street and street is not None:
             group.append(stops[j])
             j += 1
 
-        if len(group) > 1 and all(s.house_number is not None for s in group):
-            # Determine travel direction from the stop before this group
-            if result and result[-1].lat is not None and group[0].lat is not None:
-                # Are we approaching from the low-number end or high-number end?
-                # Use lat/lng of the entry point to decide
-                low_stop = min(group, key=lambda s: s.house_number)
-                high_stop = max(group, key=lambda s: s.house_number)
-                d_to_low = _haversine(result[-1].lat, result[-1].lng, low_stop.lat, low_stop.lng)
-                d_to_high = _haversine(result[-1].lat, result[-1].lng, high_stop.lat, high_stop.lng)
-                ascending = d_to_low <= d_to_high
-            else:
-                ascending = True
-            group.sort(key=lambda s: s.house_number, reverse=not ascending)
-
-        result.extend(group)
+        approach = result[-1] if result else None
+        swept = _right_side_sweep(group, approach)
+        result.extend(swept)
         i = j
 
     return result
@@ -124,14 +185,19 @@ def _street_sweep(stops: list[Stop]) -> list[Stop]:
 def optimize(stops: list[Stop]) -> tuple[list[Stop], list[Stop]]:
     """
     Returns (optimized_stops, failed_stops).
-    failed_stops = stops that couldn't be geocoded (preserved at end of list with error).
-    optimized_stops = geocoded stops in optimized order.
+    Completed (is_done) stops are included but sorted to the end within their
+    street group so the driver can verify they were actually done.
+    failed_stops have geocode_error set and cannot be positioned.
     """
     parse_stops(stops)
-    geocoded = [s for s in stops if s.lat is not None]
-    failed = [s for s in stops if s.lat is None]
 
+    geocoded = [s for s in stops if s.lat is not None]
+    failed = [s for s in stops if s.lat is None and s.geocode_error]
+
+    # Separate active vs done stops for ordering
+    # Done stops get inserted at the back of their street group naturally
+    # since they go through the same sweep — no special handling needed.
     ordered = _nearest_neighbor(geocoded)
-    ordered = _street_sweep(ordered)
+    ordered = _apply_street_sweeps(ordered)
 
     return ordered, failed

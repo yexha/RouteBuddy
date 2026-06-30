@@ -10,8 +10,8 @@ from PyQt6.QtWidgets import (
     QHeaderView, QAbstractItemView, QStatusBar, QDialog,
     QComboBox, QDialogButtonBox, QTextEdit, QApplication,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QMimeData
-from PyQt6.QtGui import QColor, QFont, QDragEnterEvent, QDropEvent
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QColor, QFont
 
 from core import config as cfg_module
 from core.route_optimizer import Stop, optimize
@@ -20,10 +20,10 @@ from core.photo_extractor import extract_from_photo
 from core import csv_importer
 
 
-# ── Worker thread for geocoding (keeps UI responsive) ──────────────────────
+# ── Worker: geocoding (runs off UI thread) ─────────────────────────────────
 class GeocodeWorker(QThread):
-    progress = pyqtSignal(int, int, str)   # current, total, address
-    finished = pyqtSignal(list)            # list[Stop] with lat/lng filled
+    progress = pyqtSignal(int, int, str)
+    finished = pyqtSignal(list)
 
     def __init__(self, stops: list[Stop], city_bias: str):
         super().__init__()
@@ -44,19 +44,35 @@ class GeocodeWorker(QThread):
         self.finished.emit(self.stops)
 
 
-# ── Column mapping dialog (CSV import) ─────────────────────────────────────
+# ── Worker: OCR photo (can be slow on first run while model loads) ──────────
+class PhotoWorker(QThread):
+    finished = pyqtSignal(list, str)   # (results, error_message)
+
+    def __init__(self, path: str):
+        super().__init__()
+        self.path = path
+
+    def run(self):
+        try:
+            results = extract_from_photo(self.path)
+            self.finished.emit(results, "")
+        except Exception as e:
+            self.finished.emit([], str(e))
+
+
+# ── Column mapping dialog ───────────────────────────────────────────────────
 class ColumnMappingDialog(QDialog):
     def __init__(self, columns: list[str], guess: dict, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Map Spreadsheet Columns")
-        self.setMinimumWidth(400)
+        self.setMinimumWidth(420)
         layout = QVBoxLayout(self)
-
-        layout.addWidget(QLabel("Tell RouteBuddy which columns contain each field.\nThis will be remembered for next time."))
-
+        layout.addWidget(QLabel(
+            "Tell RouteBuddy which columns contain each field.\n"
+            "This will be remembered for next time."
+        ))
         self.combos = {}
-        fields = [("address", "Street Address *"), ("customer_name", "Customer Name"), ("notes", "Notes / Gate Codes")]
-        for field, label in fields:
+        for field, label in [("address", "Street Address *"), ("customer_name", "Customer Name"), ("notes", "Notes / Gate Codes")]:
             row = QHBoxLayout()
             row.addWidget(QLabel(label + ":"))
             combo = QComboBox()
@@ -68,70 +84,117 @@ class ColumnMappingDialog(QDialog):
             row.addWidget(combo)
             layout.addLayout(row)
             self.combos[field] = combo
-
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
 
     def get_mapping(self) -> dict:
-        result = {}
-        for field, combo in self.combos.items():
-            val = combo.currentText()
-            result[field] = val if val != "(none)" else None
-        return result
+        return {f: (c.currentText() if c.currentText() != "(none)" else None) for f, c in self.combos.items()}
 
 
 # ── Photo review dialog ─────────────────────────────────────────────────────
 class PhotoReviewDialog(QDialog):
-    def __init__(self, extracted: list[dict], skip_struck: bool, parent=None):
+    def __init__(self, extracted: list[dict], parent=None):
         super().__init__(parent)
         self.setWindowTitle("Review Extracted Addresses")
-        self.setMinimumSize(700, 500)
+        self.setMinimumSize(750, 520)
         layout = QVBoxLayout(self)
 
-        layout.addWidget(QLabel(
-            "Claude extracted the addresses below from your photo.\n"
-            "Review and correct anything misread before adding to route.\n"
-            "Struck-through rows (grey) are marked as completed — uncheck to include them."
-        ))
+        info = QLabel(
+            "RouteBuddy read the addresses below from your photo.\n"
+            "Grey rows were crossed out on the paper — they're included so you can verify,\n"
+            "but unchecked by default. Check any you still need to do.\n\n"
+            "Double-click any cell to fix a misread address before adding to route."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
 
         self.table = QTableWidget(len(extracted), 4)
         self.table.setHorizontalHeaderLabels(["Include", "Customer", "Address", "Notes"])
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
 
+        DONE_BG = QColor("#e8e8e8")
+        DONE_FG = QColor("#888888")
+
         for row, entry in enumerate(extracted):
             struck = entry.get("struck_through", False)
 
             chk = QTableWidgetItem()
             chk.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
-            chk.setCheckState(Qt.CheckState.Unchecked if (struck and skip_struck) else Qt.CheckState.Checked)
+            # Struck-through = already done → unchecked by default, but included so driver can verify
+            chk.setCheckState(Qt.CheckState.Unchecked if struck else Qt.CheckState.Checked)
             self.table.setItem(row, 0, chk)
 
             for col, key in [(1, "customer_name"), (2, "address"), (3, "notes")]:
                 item = QTableWidgetItem(entry.get(key, ""))
                 if struck:
-                    item.setForeground(QColor("#999999"))
+                    item.setBackground(DONE_BG)
+                    item.setForeground(DONE_FG)
                 self.table.setItem(row, col, item)
 
         layout.addWidget(self.table)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        # Select/deselect all buttons
+        btn_row = QHBoxLayout()
+        btn_all = QPushButton("Check All")
+        btn_all.clicked.connect(lambda: self._set_all(True))
+        btn_none = QPushButton("Uncheck All")
+        btn_none.clicked.connect(lambda: self._set_all(False))
+        btn_row.addWidget(btn_all)
+        btn_row.addWidget(btn_none)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def _set_all(self, checked: bool):
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        for row in range(self.table.rowCount()):
+            self.table.item(row, 0).setCheckState(state)
 
     def get_selected(self) -> list[dict]:
-        result = []
+        results = []
         for row in range(self.table.rowCount()):
-            if self.table.item(row, 0).checkState() == Qt.CheckState.Checked:
-                result.append({
-                    "customer_name": self.table.item(row, 1).text().strip(),
-                    "address": self.table.item(row, 2).text().strip(),
-                    "notes": self.table.item(row, 3).text().strip(),
-                })
-        return result
+            results.append({
+                "include": self.table.item(row, 0).checkState() == Qt.CheckState.Checked,
+                "customer_name": self.table.item(row, 1).text().strip(),
+                "address": self.table.item(row, 2).text().strip(),
+                "notes": self.table.item(row, 3).text().strip(),
+            })
+        return results
+
+
+# ── Settings dialog ──────────────────────────────────────────────────────────
+class SettingsDialog(QDialog):
+    def __init__(self, cfg: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.setMinimumWidth(400)
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel("Default City / Area:"))
+        self.city = QLineEdit(cfg.get("city_bias", ""))
+        self.city.setPlaceholderText("e.g. Okotoks, AB")
+        layout.addWidget(self.city)
+
+        layout.addWidget(QLabel(
+            "\nPhoto OCR runs locally on your computer — no internet or API key needed.\n"
+            "First load takes ~30 seconds while the OCR model initialises.",
+            styleSheet="color: #555; font-size: 11px;"
+        ))
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def get_values(self) -> dict:
+        return {"city_bias": self.city.text().strip()}
 
 
 # ── Main window ─────────────────────────────────────────────────────────────
@@ -142,9 +205,10 @@ class MainWindow(QMainWindow):
         self.stops: list[Stop] = []
         self.optimized: list[Stop] = []
         self.failed: list[Stop] = []
-        self._worker = None
+        self._geo_worker = None
+        self._photo_worker = None
         self.setWindowTitle("RouteBuddy — Route Optimizer")
-        self.setMinimumSize(1000, 700)
+        self.setMinimumSize(1050, 720)
         self._build_ui()
 
     def _build_ui(self):
@@ -153,138 +217,161 @@ class MainWindow(QMainWindow):
         root = QVBoxLayout(central)
         root.setSpacing(8)
 
-        # ── Top toolbar ──
+        # ── Toolbar ──
         toolbar = QHBoxLayout()
 
         toolbar.addWidget(QLabel("City / Area:"))
         self.city_input = QLineEdit(self.cfg.get("city_bias", ""))
         self.city_input.setPlaceholderText("e.g. Okotoks, AB  or  Calgary, AB")
-        self.city_input.setFixedWidth(220)
+        self.city_input.setFixedWidth(230)
         self.city_input.textChanged.connect(self._save_city)
         toolbar.addWidget(self.city_input)
 
-        toolbar.addSpacing(16)
+        toolbar.addSpacing(12)
 
-        btn_photo = QPushButton("Import from Photo")
-        btn_photo.setToolTip("Take/select a photo of your paper route list")
-        btn_photo.clicked.connect(self._import_photo)
-        toolbar.addWidget(btn_photo)
+        self.btn_photo = QPushButton("📷  Import from Photo")
+        self.btn_photo.setToolTip("Select a photo of your paper route list — OCR runs locally, no internet needed")
+        self.btn_photo.clicked.connect(self._import_photo)
+        toolbar.addWidget(self.btn_photo)
 
-        btn_csv = QPushButton("Import CSV / Excel")
+        btn_csv = QPushButton("📄  Import CSV / Excel")
         btn_csv.clicked.connect(self._import_csv)
         toolbar.addWidget(btn_csv)
 
-        btn_clear = QPushButton("Clear All")
+        btn_clear = QPushButton("Clear")
         btn_clear.clicked.connect(self._clear)
         toolbar.addWidget(btn_clear)
 
         toolbar.addStretch()
 
-        btn_optimize = QPushButton("▶  Optimize Route")
-        btn_optimize.setStyleSheet("font-weight: bold; padding: 4px 16px;")
-        btn_optimize.clicked.connect(self._run_optimize)
-        toolbar.addWidget(btn_optimize)
+        self.btn_optimize = QPushButton("▶  Optimize Route")
+        self.btn_optimize.setStyleSheet("font-weight: bold; padding: 4px 18px; background: #2a6ebb; color: white;")
+        self.btn_optimize.clicked.connect(self._run_optimize)
+        toolbar.addWidget(self.btn_optimize)
 
-        btn_export = QPushButton("Export Route")
+        btn_export = QPushButton("Export")
         btn_export.clicked.connect(self._export)
         toolbar.addWidget(btn_export)
 
-        btn_settings = QPushButton("⚙ Settings")
-        btn_settings.clicked.connect(self._open_settings)
-        toolbar.addWidget(btn_settings)
-
         root.addLayout(toolbar)
 
-        # ── Main split: original | optimized ──
+        # ── City hint label ──
+        self.city_hint = QLabel("")
+        self.city_hint.setStyleSheet("color: #cc6600; font-size: 11px; padding-left: 4px;")
+        root.addWidget(self.city_hint)
+        self._update_city_hint()
+        self.city_input.textChanged.connect(lambda _: self._update_city_hint())
+
+        # ── Split: original | optimized ──
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        left_box = QGroupBox("Imported Stops (original order)")
+        left_box = QGroupBox("Imported Stops — original order")
         left_layout = QVBoxLayout(left_box)
-        self.orig_table = self._make_table()
+        self.orig_table = self._make_table(["#", "Customer", "Address", "Notes"])
         left_layout.addWidget(self.orig_table)
         splitter.addWidget(left_box)
 
-        right_box = QGroupBox("Optimized Route")
+        right_box = QGroupBox("Optimized Route — right-side sweep")
         right_layout = QVBoxLayout(right_box)
-        self.opt_table = self._make_table(show_stop_num=True)
+        self.opt_table = self._make_table(["#", "Customer", "Address", "Notes", "Status"])
         right_layout.addWidget(self.opt_table)
         splitter.addWidget(right_box)
 
-        splitter.setSizes([480, 480])
+        splitter.setSizes([490, 490])
         root.addWidget(splitter, stretch=1)
 
-        # ── Progress + status ──
+        # ── Progress ──
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
+        self.progress_label = QLabel("")
+        self.progress_label.setStyleSheet("font-size: 11px; color: #444;")
         root.addWidget(self.progress_bar)
+        root.addWidget(self.progress_label)
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
-        self.status.showMessage("Ready — import a photo or CSV to begin.")
+        self.status.showMessage("Ready — set your city above, then import a photo or CSV.")
 
-    def _make_table(self, show_stop_num: bool = False) -> QTableWidget:
-        headers = (["#", "Customer", "Address", "Notes", "Status"] if show_stop_num
-                   else ["#", "Customer", "Address", "Notes"])
+    def _make_table(self, headers: list[str]) -> QTableWidget:
         t = QTableWidget(0, len(headers))
         t.setHorizontalHeaderLabels(headers)
-        t.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        addr_col = 2 if len(headers) >= 3 else 0
+        t.horizontalHeader().setSectionResizeMode(addr_col, QHeaderView.ResizeMode.Stretch)
         t.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked)
         t.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        t.verticalHeader().setDefaultSectionSize(24)
+        t.verticalHeader().setDefaultSectionSize(22)
         t.setAlternatingRowColors(True)
         return t
 
-    # ── Import handlers ──────────────────────────────────────────────────────
+    def _update_city_hint(self):
+        if not self.city_input.text().strip():
+            self.city_hint.setText("⚠  Set a city/area so addresses resolve to the right location in Alberta.")
+        else:
+            self.city_hint.setText("")
+
+    # ── Photo import ─────────────────────────────────────────────────────────
 
     def _import_photo(self):
-        if not self.cfg.get("claude_api_key"):
-            QMessageBox.warning(self, "API Key Required",
-                "A Claude API key is needed for photo extraction.\n"
-                "Go to ⚙ Settings to add your key.")
-            return
-
         path, _ = QFileDialog.getOpenFileName(
             self, "Select Route Photo", "",
-            "Images (*.jpg *.jpeg *.png *.webp);;All Files (*)")
+            "Images (*.jpg *.jpeg *.png *.webp *.bmp);;All Files (*)")
         if not path:
             return
 
-        self.status.showMessage("Extracting addresses from photo…")
+        self.btn_photo.setEnabled(False)
+        self.btn_photo.setText("Reading photo…")
+        self.progress_label.setText("Loading OCR model (first time takes ~30 sec)…")
         QApplication.processEvents()
-        try:
-            extracted = extract_from_photo(path, self.cfg["claude_api_key"])
-        except Exception as e:
-            QMessageBox.critical(self, "Extraction Failed", str(e))
-            self.status.showMessage("Photo extraction failed.")
+
+        self._photo_worker = PhotoWorker(path)
+        self._photo_worker.finished.connect(self._on_photo_done)
+        self._photo_worker.start()
+
+    def _on_photo_done(self, extracted: list, error: str):
+        self.btn_photo.setEnabled(True)
+        self.btn_photo.setText("📷  Import from Photo")
+        self.progress_label.setText("")
+
+        if error:
+            QMessageBox.critical(self, "Photo Read Failed",
+                f"Could not read addresses from photo:\n\n{error}")
+            self.status.showMessage("Photo import failed.")
             return
 
         if not extracted:
-            QMessageBox.warning(self, "Nothing Found", "No addresses were found in the photo.")
+            QMessageBox.warning(self, "Nothing Found",
+                "No addresses were found in the photo. Try a clearer/closer photo.")
             return
 
-        dlg = PhotoReviewDialog(extracted, self.cfg.get("skip_struck_through", True), self)
+        dlg = PhotoReviewDialog(extracted, self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
         selected = dlg.get_selected()
-        if not selected:
-            return
-
+        added = 0
         city = self.city_input.text().strip()
-        for i, entry in enumerate(selected):
+
+        for entry in selected:
             addr = entry["address"]
-            if city and not any(c in addr.lower() for c in [",", "ab", "alberta"]):
+            if not addr:
+                continue
+            if city and "," not in addr:
                 addr = f"{addr}, {city}"
+
             stop = Stop(
-                index=len(self.stops) + i,
+                index=len(self.stops),
                 raw_address=addr,
-                customer_name=entry.get("customer_name", ""),
-                notes=entry.get("notes", ""),
+                customer_name=entry["customer_name"],
+                notes=entry["notes"],
+                is_done=not entry["include"],
             )
             self.stops.append(stop)
+            added += 1
 
         self._refresh_orig_table()
-        self.status.showMessage(f"Added {len(selected)} stops from photo. Click 'Optimize Route' when ready.")
+        self.status.showMessage(f"Added {added} stops from photo. Click '▶ Optimize Route' when ready.")
+
+    # ── CSV import ────────────────────────────────────────────────────────────
 
     def _import_csv(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -292,7 +379,6 @@ class MainWindow(QMainWindow):
             "Spreadsheets (*.csv *.xlsx *.xls);;All Files (*)")
         if not path:
             return
-
         try:
             df = csv_importer.load_file(path)
         except Exception as e:
@@ -318,12 +404,12 @@ class MainWindow(QMainWindow):
             return
 
         city = self.city_input.text().strip()
-        for i, row in enumerate(rows):
+        for row in rows:
             addr = row["address"]
-            if city and not any(c in addr.lower() for c in [",", "ab", "alberta"]):
+            if city and "," not in addr:
                 addr = f"{addr}, {city}"
             self.stops.append(Stop(
-                index=len(self.stops) + i,
+                index=len(self.stops),
                 raw_address=addr,
                 customer_name=row.get("customer_name", ""),
                 notes=row.get("notes", ""),
@@ -332,44 +418,48 @@ class MainWindow(QMainWindow):
         self._refresh_orig_table()
         msg = f"Imported {len(rows)} stops."
         if skipped:
-            msg += f"  {len(skipped)} blank rows skipped (rows {', '.join(str(r) for r in skipped[:5])}{'…' if len(skipped) > 5 else ''})."
+            msg += f"  {len(skipped)} blank rows skipped."
         self.status.showMessage(msg)
 
-    # ── Geocoding + optimization ─────────────────────────────────────────────
+    # ── Optimize ──────────────────────────────────────────────────────────────
 
     def _run_optimize(self):
         if not self.stops:
             QMessageBox.information(self, "No Stops", "Import some addresses first.")
             return
 
-        ungeooded = [s for s in self.stops if s.lat is None and s.geocode_error is None]
-        if not ungeooded:
-            self._do_optimize()
-            return
-
         city = self.city_input.text().strip()
         if not city:
             reply = QMessageBox.question(self, "No City Set",
-                "No city/area is set — geocoding may resolve to wrong province.\n\nProceed anyway?",
+                "No city/area is set.\nGeocoding may pick the wrong location.\n\nProceed anyway?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if reply != QMessageBox.StandardButton.Yes:
                 return
 
+        ungeooded = [s for s in self.stops if s.lat is None and not s.geocode_error]
+        if not ungeooded:
+            self._do_optimize()
+            return
+
+        self.btn_optimize.setEnabled(False)
         self.progress_bar.setMaximum(len(ungeooded))
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
+        self.progress_label.setText(f"Geocoding 0/{len(ungeooded)}…")
 
-        self._worker = GeocodeWorker(ungeooded, city)
-        self._worker.progress.connect(self._on_geocode_progress)
-        self._worker.finished.connect(self._on_geocode_done)
-        self._worker.start()
+        self._geo_worker = GeocodeWorker(ungeooded, city)
+        self._geo_worker.progress.connect(self._on_geo_progress)
+        self._geo_worker.finished.connect(self._on_geo_done)
+        self._geo_worker.start()
 
-    def _on_geocode_progress(self, current: int, total: int, address: str):
+    def _on_geo_progress(self, current: int, total: int, address: str):
         self.progress_bar.setValue(current)
-        self.status.showMessage(f"Geocoding {current}/{total}: {address}")
+        self.progress_label.setText(f"Geocoding {current}/{total}: {address}")
 
-    def _on_geocode_done(self, stops: list[Stop]):
+    def _on_geo_done(self, _):
         self.progress_bar.setVisible(False)
+        self.progress_label.setText("")
+        self.btn_optimize.setEnabled(True)
         self._do_optimize()
 
     def _do_optimize(self):
@@ -377,15 +467,34 @@ class MainWindow(QMainWindow):
         self.optimized = optimized
         self.failed = failed
 
+        DONE_BG = QColor("#e8e8e8")
+        DONE_FG = QColor("#888888")
+        ERROR_BG = QColor("#fff0f0")
+        ERROR_FG = QColor("#cc0000")
+
         self.opt_table.setRowCount(0)
-        for stop_num, stop in enumerate(optimized, 1):
+        stop_num = 0
+
+        for stop in optimized:
+            stop_num += 1
             row = self.opt_table.rowCount()
             self.opt_table.insertRow(row)
-            self.opt_table.setItem(row, 0, QTableWidgetItem(str(stop_num)))
+
+            num_item = QTableWidgetItem(str(stop_num))
+            if stop.is_done:
+                num_item.setText(f"✓{stop_num}")
+            self.opt_table.setItem(row, 0, num_item)
             self.opt_table.setItem(row, 1, QTableWidgetItem(stop.customer_name))
             self.opt_table.setItem(row, 2, QTableWidgetItem(stop.raw_address))
             self.opt_table.setItem(row, 3, QTableWidgetItem(stop.notes))
-            self.opt_table.setItem(row, 4, QTableWidgetItem("✓ Ready"))
+            status = QTableWidgetItem("Done" if stop.is_done else "")
+            self.opt_table.setItem(row, 4, status)
+
+            if stop.is_done:
+                for col in range(5):
+                    if self.opt_table.item(row, col):
+                        self.opt_table.item(row, col).setBackground(DONE_BG)
+                        self.opt_table.item(row, col).setForeground(DONE_FG)
 
         for stop in failed:
             row = self.opt_table.rowCount()
@@ -394,25 +503,24 @@ class MainWindow(QMainWindow):
             self.opt_table.setItem(row, 1, QTableWidgetItem(stop.customer_name))
             self.opt_table.setItem(row, 2, QTableWidgetItem(stop.raw_address))
             self.opt_table.setItem(row, 3, QTableWidgetItem(stop.notes))
-            err_item = QTableWidgetItem(f"GEOCODE FAILED: {stop.geocode_error}")
-            err_item.setForeground(QColor("#cc0000"))
-            self.opt_table.setItem(row, 4, err_item)
+            self.opt_table.setItem(row, 4, QTableWidgetItem(f"GEOCODE FAILED: {stop.geocode_error}"))
             for col in range(5):
                 if self.opt_table.item(row, col):
-                    self.opt_table.item(row, col).setBackground(QColor("#fff0f0"))
+                    self.opt_table.item(row, col).setBackground(ERROR_BG)
+                    self.opt_table.item(row, col).setForeground(ERROR_FG)
 
         msg = f"Optimized {len(optimized)} stops."
         if failed:
-            msg += f"  ⚠ {len(failed)} address(es) could not be geocoded — shown in red at the bottom."
+            msg += f"  ⚠ {len(failed)} address(es) could not be geocoded — shown in red."
         self.status.showMessage(msg)
 
         if failed:
             names = "\n".join(f"  • {s.raw_address}  ({s.geocode_error})" for s in failed)
             QMessageBox.warning(self, "Geocoding Failures",
-                f"{len(failed)} address(es) could not be located and are placed at the end of the route:\n\n{names}\n\n"
-                "Check for typos or try a more specific address.")
+                f"{len(failed)} address(es) could not be located:\n\n{names}\n\n"
+                "Check for typos. They appear at the bottom of the route list.")
 
-    # ── Helpers ──────────────────────────────────────────────────────────────
+    # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _refresh_orig_table(self):
         self.orig_table.setRowCount(0)
@@ -423,6 +531,10 @@ class MainWindow(QMainWindow):
             self.orig_table.setItem(row, 1, QTableWidgetItem(stop.customer_name))
             self.orig_table.setItem(row, 2, QTableWidgetItem(stop.raw_address))
             self.orig_table.setItem(row, 3, QTableWidgetItem(stop.notes))
+            if stop.is_done:
+                for col in range(4):
+                    if self.orig_table.item(row, col):
+                        self.orig_table.item(row, col).setForeground(QColor("#999999"))
 
     def _clear(self):
         self.stops.clear()
@@ -444,65 +556,18 @@ class MainWindow(QMainWindow):
             self, "Export Route", "route.txt", "Text Files (*.txt);;CSV (*.csv)")
         if not path:
             return
-        lines = ["OPTIMIZED ROUTE\n" + "=" * 40]
+        lines = ["OPTIMIZED ROUTE — RouteBuddy", "=" * 50]
         for i, stop in enumerate(self.optimized, 1):
-            line = f"{i:3}. {stop.raw_address}"
+            status = " [DONE]" if stop.is_done else ""
+            line = f"{i:3}.{status} {stop.raw_address}"
             if stop.customer_name:
                 line += f"  [{stop.customer_name}]"
             if stop.notes:
                 line += f"  — {stop.notes}"
             lines.append(line)
         if self.failed:
-            lines.append("\nCOULD NOT GEOCODE (verify manually):")
+            lines += ["", "COULD NOT GEOCODE — verify manually:"]
             for stop in self.failed:
                 lines.append(f"  ✗ {stop.raw_address}  ({stop.geocode_error})")
         Path(path).write_text("\n".join(lines), encoding="utf-8")
-        self.status.showMessage(f"Exported to {path}")
-
-    def _open_settings(self):
-        dlg = SettingsDialog(self.cfg, self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            self.cfg.update(dlg.get_values())
-            self.city_input.setText(self.cfg.get("city_bias", ""))
-            cfg_module.save(self.cfg)
-
-
-# ── Settings dialog ──────────────────────────────────────────────────────────
-class SettingsDialog(QDialog):
-    def __init__(self, cfg: dict, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Settings")
-        self.setMinimumWidth(450)
-        layout = QVBoxLayout(self)
-
-        layout.addWidget(QLabel("Claude API Key (for photo extraction):"))
-        self.api_key = QLineEdit(cfg.get("claude_api_key", ""))
-        self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
-        self.api_key.setPlaceholderText("sk-ant-…")
-        layout.addWidget(self.api_key)
-
-        layout.addWidget(QLabel("Default City / Area:"))
-        self.city = QLineEdit(cfg.get("city_bias", ""))
-        self.city.setPlaceholderText("e.g. Okotoks, AB")
-        layout.addWidget(self.city)
-
-        self.skip_struck = QCheckBox("Skip struck-through addresses in photos (treat as completed)")
-        self.skip_struck.setChecked(cfg.get("skip_struck_through", True))
-        layout.addWidget(self.skip_struck)
-
-        layout.addWidget(QLabel(
-            "\nNote: The Claude API key is stored locally in\n~/.routebuddy/config.json and never sent anywhere\nexcept Anthropic's API for photo processing.",
-            styleSheet="color: #666; font-size: 11px;"
-        ))
-
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-    def get_values(self) -> dict:
-        return {
-            "claude_api_key": self.api_key.text().strip(),
-            "city_bias": self.city.text().strip(),
-            "skip_struck_through": self.skip_struck.isChecked(),
-        }
+        self.status.showMessage(f"Route exported to {path}")
