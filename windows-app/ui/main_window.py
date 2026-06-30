@@ -46,7 +46,7 @@ class GeocodeWorker(QThread):
 
 # ── Worker: OCR photo (can be slow on first run while model loads) ──────────
 class PhotoWorker(QThread):
-    finished = pyqtSignal(list, str)   # (results, error_message)
+    finished = pyqtSignal(list, list, str)   # (addresses, skipped, error_message)
 
     def __init__(self, path: str):
         super().__init__()
@@ -54,10 +54,10 @@ class PhotoWorker(QThread):
 
     def run(self):
         try:
-            results = extract_from_photo(self.path)
-            self.finished.emit(results, "")
+            addresses, skipped = extract_from_photo(self.path)
+            self.finished.emit(addresses, skipped, "")
         except Exception as e:
-            self.finished.emit([], str(e))
+            self.finished.emit([], [], str(e))
 
 
 # ── Column mapping dialog ───────────────────────────────────────────────────
@@ -95,30 +95,31 @@ class ColumnMappingDialog(QDialog):
 
 # ── Photo review dialog ─────────────────────────────────────────────────────
 class PhotoReviewDialog(QDialog):
-    def __init__(self, extracted: list[dict], parent=None):
+    def __init__(self, addresses: list[dict], skipped: list[str], parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Review Extracted Addresses")
-        self.setMinimumSize(750, 520)
+        self.setWindowTitle("Review Addresses")
+        self.setMinimumSize(560, 540)
         layout = QVBoxLayout(self)
 
         info = QLabel(
-            "RouteBuddy read the addresses below from your photo.\n"
-            "Grey rows were crossed out on the paper — they're included so you can verify,\n"
-            "but unchecked by default. Check any you still need to do.\n\n"
-            "Double-click any cell to fix a misread address before adding to route."
+            "RouteBuddy read these addresses from your photo.\n"
+            "Grey rows were crossed out on the paper (already done) — included so you\n"
+            "can verify, but unchecked by default.\n\n"
+            "Double-click an address to fix a misread before adding it to the route."
         )
         info.setWordWrap(True)
         layout.addWidget(info)
 
-        self.table = QTableWidget(len(extracted), 4)
-        self.table.setHorizontalHeaderLabels(["Include", "Customer", "Address", "Notes"])
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.table = QTableWidget(len(addresses), 2)
+        self.table.setHorizontalHeaderLabels(["Include", "Address"])
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table.setColumnWidth(0, 70)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
 
         DONE_BG = QColor("#e8e8e8")
         DONE_FG = QColor("#888888")
 
-        for row, entry in enumerate(extracted):
+        for row, entry in enumerate(addresses):
             struck = entry.get("struck_through", False)
 
             chk = QTableWidgetItem()
@@ -127,14 +128,23 @@ class PhotoReviewDialog(QDialog):
             chk.setCheckState(Qt.CheckState.Unchecked if struck else Qt.CheckState.Checked)
             self.table.setItem(row, 0, chk)
 
-            for col, key in [(1, "customer_name"), (2, "address"), (3, "notes")]:
-                item = QTableWidgetItem(entry.get(key, ""))
-                if struck:
-                    item.setBackground(DONE_BG)
-                    item.setForeground(DONE_FG)
-                self.table.setItem(row, col, item)
+            item = QTableWidgetItem(entry.get("address", ""))
+            if struck:
+                item.setBackground(DONE_BG)
+                item.setForeground(DONE_FG)
+            self.table.setItem(row, 1, item)
 
         layout.addWidget(self.table)
+
+        if skipped:
+            note = QLabel(
+                f"⚠ {len(skipped)} line(s) had a number but no readable address and were "
+                f"left out:\n  " + "\n  ".join(skipped[:6]) +
+                ("\n  …" if len(skipped) > 6 else "")
+            )
+            note.setWordWrap(True)
+            note.setStyleSheet("color: #cc6600; font-size: 11px;")
+            layout.addWidget(note)
 
         # Select/deselect all buttons
         btn_row = QHBoxLayout()
@@ -162,9 +172,7 @@ class PhotoReviewDialog(QDialog):
         for row in range(self.table.rowCount()):
             results.append({
                 "include": self.table.item(row, 0).checkState() == Qt.CheckState.Checked,
-                "customer_name": self.table.item(row, 1).text().strip(),
-                "address": self.table.item(row, 2).text().strip(),
-                "notes": self.table.item(row, 3).text().strip(),
+                "address": self.table.item(row, 1).text().strip(),
             })
         return results
 
@@ -327,7 +335,7 @@ class MainWindow(QMainWindow):
         self._photo_worker.finished.connect(self._on_photo_done)
         self._photo_worker.start()
 
-    def _on_photo_done(self, extracted: list, error: str):
+    def _on_photo_done(self, addresses: list, skipped: list, error: str):
         self.btn_photo.setEnabled(True)
         self.btn_photo.setText("📷  Import from Photo")
         self.progress_label.setText("")
@@ -338,12 +346,17 @@ class MainWindow(QMainWindow):
             self.status.showMessage("Photo import failed.")
             return
 
-        if not extracted:
-            QMessageBox.warning(self, "Nothing Found",
-                "No addresses were found in the photo. Try a clearer/closer photo.")
+        if not addresses:
+            extra = ""
+            if skipped:
+                extra = ("\n\nLines with text but no readable address:\n  "
+                         + "\n  ".join(skipped[:8]))
+            QMessageBox.warning(self, "No Addresses Found",
+                "No addresses could be read from the photo. Try a clearer, "
+                "straight-on photo with good lighting." + extra)
             return
 
-        dlg = PhotoReviewDialog(extracted, self)
+        dlg = PhotoReviewDialog(addresses, skipped, self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
@@ -361,15 +374,18 @@ class MainWindow(QMainWindow):
             stop = Stop(
                 index=len(self.stops),
                 raw_address=addr,
-                customer_name=entry["customer_name"],
-                notes=entry["notes"],
+                customer_name="",
+                notes="",
                 is_done=not entry["include"],
             )
             self.stops.append(stop)
             added += 1
 
         self._refresh_orig_table()
-        self.status.showMessage(f"Added {added} stops from photo. Click '▶ Optimize Route' when ready.")
+        msg = f"Added {added} address(es) from photo. Click '▶ Optimize Route' when ready."
+        if skipped:
+            msg += f"  ({len(skipped)} unreadable line(s) left out.)"
+        self.status.showMessage(msg)
 
     # ── CSV import ────────────────────────────────────────────────────────────
 
